@@ -1,0 +1,11 @@
+/target
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Local env / secrets
+.env
+.env.*

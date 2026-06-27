@@ -262,4 +262,7 @@ MIT © white1or1black. See [LICENSE](LICENSE).
 The agent core's algorithms — fuzzy edit matching, compaction, streaming-JSON
 repair, truncation, and the overall agent-loop design — are from-scratch
 reimplementations of those in [`pi`](https://github.com/earendil-works/pi) by
-earendil-works. This project is independent and not affiliated with pi.
+Mario Zechner (earendil-works). This project is an independent reimplementation
+written from scratch in a different language; it is not affiliated with, or
+endorsed by, pi. pi's MIT license and copyright are reproduced in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

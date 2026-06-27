@@ -112,7 +112,7 @@ fn parse_skill_file(path: &Path, dir: &Path, source: SkillSource) -> Option<Skil
         .as_ref()
         .map(|p| p.name.clone())
         .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| dir_name);
+        .unwrap_or(dir_name);
     let description = parsed
         .as_ref()
         .map(|p| p.description.clone())

@@ -72,25 +72,18 @@ pub async fn run_interactive(
 }
 
 fn print_banner(session: &AgentSession) {
-    let tools = session.tool_names().join(", ");
     let usage_pct = (session.context_usage() * 100.0).round() as u64;
+    // Simplified banner - essential info only
     println!(
-        "{} v{}  —  {} {}  —  {}",
+        "{} v{} — {} — {}%",
         magenta("pixie-pi"),
         VERSION,
-        dim("model"),
         green(&session.model.id),
-        dim(&format!("({}%)", usage_pct))
+        usage_pct
     );
-    println!("{} {}", dim("cwd"), session.cwd.display());
-    println!("{} {}", dim("tools"), tools);
-    println!(
-        "  {}  {}  {}  {}",
-        dim("/help for commands"),
-        dim("/model to switch"),
-        dim("/compact to trim"),
-        dim("/exit to quit")
-    );
+    println!("{}", dim(&format!("cwd: {}", session.cwd.display())));
+    // Only show tools hint on first launch
+    println!("{}", dim("Type /help for commands"));
     println!();
 }
 
@@ -101,19 +94,22 @@ async fn run_one(session: &mut AgentSession, msg: ai::Message, show_thinking: bo
         matches!(ev, pixie_pi::agent::context::AgentEvent::AgentEnd { .. })
     })
     .await;
-    // Print a compact cost/context line after each turn.
+    // Only print cost/context summary when there's significant usage
     let cost = session.total_usage.cost.total;
     let pct = (session.context_usage() * 100.0).round() as u64;
-    eprintln!(
-        "{}",
-        dim(&format!(
-            "  ↳ {} out, {} in, ${:.4}, ctx {}%",
-            session.total_usage.output,
-            session.total_usage.input,
-            cost,
-            pct
-        ))
-    );
+    // Only show summary if cost > $0.01 or context > 50%
+    if cost > 0.01 || pct > 50 {
+        eprintln!(
+            "{}",
+            dim(&format!(
+                "  ↳ {} out, {} in, ${:.4}, ctx {}%",
+                session.total_usage.output,
+                session.total_usage.input,
+                cost,
+                pct
+            ))
+        );
+    }
     let _ = std::io::stderr().flush();
 }
 
@@ -124,20 +120,18 @@ async fn handle_slash(session: &mut AgentSession, input: &str) -> SlashResult {
     match cmd {
         "exit" | "quit" | "q" => SlashResult::Exit,
         "help" | "h" | "?" => {
-            println!("{}", blue("Slash commands:"));
-            for (c, d) in [
-                ("/help", "show this help"),
+            println!("{}", blue("Available commands:"));
+            let cmds = [
+                ("/help", "show available commands"),
                 ("/exit", "quit the session"),
-                ("/clear", "clear the conversation"),
+                ("/clear", "clear conversation"),
                 ("/model <id>", "switch model"),
-                ("/thinking <level>", "off|minimal|low|medium|high|xhigh"),
-                ("/compact", "summarize old messages to fit the context"),
-                ("/tools", "list available tools"),
+                ("/thinking <lvl>", "set thinking level"),
+                ("/compact", "compress old messages"),
                 ("/context", "show token usage"),
-                ("/cost", "show cumulative cost"),
-                ("/system", "show the system prompt"),
-            ] {
-                println!("  {}   {}", yellow(c), dim(d));
+            ];
+            for (c, d) in cmds {
+                println!("  {}  {}", yellow(c), dim(d));
             }
             SlashResult::Continue
         }
@@ -149,21 +143,16 @@ async fn handle_slash(session: &mut AgentSession, input: &str) -> SlashResult {
         "model" => {
             let pattern = rest.join(" ");
             if pattern.is_empty() {
-                println!("{} {}", dim("current model:"), session.model.id);
+                println!("{}", dim(&format!("current: {}", session.model.id)));
                 return SlashResult::Continue;
             }
             match ai::resolve_model(&ai::builtin_models(), &pattern) {
                 Some(m) => {
-                    println!("{} {} → {}", dim("model"), session.model.id, green(&m.id));
+                    println!("{} → {}", dim(&session.model.id), green(&m.id));
                     session.model = m;
                 }
                 None => {
-                    let avail = ai::builtin_models()
-                        .iter()
-                        .map(|m| m.id.clone())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    println!("{}", red(&format!("Unknown model. Available: {avail}")));
+                    eprintln!("{}", red("Unknown model"));
                 }
             }
             SlashResult::Continue
@@ -173,13 +162,10 @@ async fn handle_slash(session: &mut AgentSession, input: &str) -> SlashResult {
             match ThinkingLevel::parse(level) {
                 Some(t) => {
                     session.thinking = t;
-                    println!("{} thinking={:?}", dim("set"), t);
+                    println!("{}", dim(&format!("thinking: {:?}", t)));
                 }
                 None => {
-                    println!(
-                        "{}",
-                        red("Usage: /thinking off|minimal|low|medium|high|xhigh")
-                    );
+                    eprintln!("{}", red("Invalid thinking level (off/minimal/low/medium/high/xhigh)"));
                 }
             }
             SlashResult::Continue
@@ -187,7 +173,7 @@ async fn handle_slash(session: &mut AgentSession, input: &str) -> SlashResult {
         "compact" => {
             let dropped = session.compact().await;
             let _ = session.save();
-            println!("{}", green(&format!("Compacted: dropped {dropped} messages.")));
+            println!("{}", green(&format!("Compacted: {} messages", dropped)));
             SlashResult::Continue
         }
         "tools" => {
@@ -197,40 +183,27 @@ async fn handle_slash(session: &mut AgentSession, input: &str) -> SlashResult {
         }
         "context" | "ctx" => {
             let pct = (session.context_usage() * 100.0).round() as u64;
-            println!(
-                "{} ~{} tokens / {} ({}%)",
-                dim("context"),
-                session.estimated_tokens(),
-                session.model.context_window,
-                pct
-            );
+            let estimated = session.estimated_tokens();
+            println!("{}", dim(&format!("{}/{} tokens ({}%)", estimated, session.model.context_window, pct)));
             SlashResult::Continue
         }
         "cost" => {
             let u = &session.total_usage;
-            println!(
-                "{} in={} out={} cache_read={} cache_write={} cost=${:.6}",
-                dim("usage"),
-                u.input,
-                u.output,
-                u.cache_read,
-                u.cache_write,
-                u.cost.total
-            );
+            println!("${:.6} ({} in, {} out)", u.cost.total, u.input, u.output);
             SlashResult::Continue
         }
         "system" => {
             let s = &session.system_prompt;
-            let preview: String = s.chars().take(600).collect();
-            println!("{preview}");
-            if s.chars().count() > 600 {
-                println!("{}", dim("…(truncated)"));
+            let preview: String = s.chars().take(400).collect();
+            println!("{}", preview);
+            if s.chars().count() > 400 {
+                println!("{}", dim("…"));
             }
             SlashResult::Continue
         }
         "" => SlashResult::Continue,
         other => {
-            println!("{}", red(&format!("Unknown command: /{other} (try /help)")));
+            eprintln!("{}", red(&format!("Unknown command: /{} (try /help)", other)));
             SlashResult::Continue
         }
     }

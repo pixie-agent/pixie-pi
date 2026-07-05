@@ -153,11 +153,12 @@ impl EventRenderer {
                     self.text_open = false;
                 }
                 let summary = tool_call_summary(tool_name, args);
-                eprintln!("{} {}", blue(&format!("⏺ {tool_name}")), dim(&summary));
+                // Only show tool icon and name for cleaner output
+                eprintln!("{}{}", blue("⏺"), dim(&format!(" {}{}", tool_name, summary)));
             }
             AgentEvent::ToolExecutionEnd { is_error, .. } => {
                 if *is_error {
-                    eprintln!("{}", red("  ⎿  (error)"));
+                    eprintln!("{}", red("  ✗"));
                 }
             }
             AgentEvent::TurnEnd { message, .. } => {

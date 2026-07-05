@@ -4,12 +4,12 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::ai::types::{ToolResultContent};
 use crate::agent::tool::{AgentTool, ToolResult};
-use crate::tools::truncate::{format_size, truncate_head, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
+use crate::ai::types::ToolResultContent;
+use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size, truncate_head};
 use crate::tools::util::{display_path, resolve_read_path};
 
 pub struct ReadTool {
@@ -43,6 +43,50 @@ fn detect_image_mime(path: &str) -> Option<&'static str> {
     }
 }
 
+fn logical_line_count(content: &str) -> usize {
+    if content.is_empty() {
+        return 0;
+    }
+    let newlines = content.as_bytes().iter().filter(|&&b| b == b'\n').count();
+    newlines + usize::from(!content.ends_with('\n'))
+}
+
+fn line_start_byte(content: &str, zero_based_line: usize) -> usize {
+    if zero_based_line == 0 {
+        return 0;
+    }
+    let mut seen = 0usize;
+    for (i, b) in content.as_bytes().iter().enumerate() {
+        if *b == b'\n' {
+            seen += 1;
+            if seen == zero_based_line {
+                return i + 1;
+            }
+        }
+    }
+    content.len()
+}
+
+fn line_end_byte(content: &str, end_line_exclusive: usize, total_lines: usize) -> usize {
+    if end_line_exclusive >= total_lines {
+        return if content.ends_with('\n') {
+            content.len().saturating_sub(1)
+        } else {
+            content.len()
+        };
+    }
+    let mut seen = 0usize;
+    for (i, b) in content.as_bytes().iter().enumerate() {
+        if *b == b'\n' {
+            seen += 1;
+            if seen == end_line_exclusive {
+                return i;
+            }
+        }
+    }
+    content.len()
+}
+
 #[async_trait]
 impl AgentTool for ReadTool {
     fn name(&self) -> &str {
@@ -65,9 +109,10 @@ impl AgentTool for ReadTool {
 
     async fn execute(&self, args: Value, cancel: CancellationToken) -> anyhow::Result<ToolResult> {
         let input: ReadInput = serde_json::from_value(args)?;
-        let path_str = input.path.or(input.file_path).ok_or_else(|| {
-            anyhow::anyhow!("read requires a 'path' parameter")
-        })?;
+        let path_str = input
+            .path
+            .or(input.file_path)
+            .ok_or_else(|| anyhow::anyhow!("read requires a 'path' parameter"))?;
         if cancel.is_cancelled() {
             anyhow::bail!("Operation aborted");
         }
@@ -101,16 +146,7 @@ impl AgentTool for ReadTool {
         }
 
         let raw = tokio::fs::read_to_string(&abs).await?;
-        // `split('\n')` yields a trailing empty element when the file ends with a
-        // newline (i.e. virtually every source file). Drop it so a 3-line file
-        // counts as 3 lines, not 4: offset validation is then exact, partial
-        // reads report the true remaining-line count, and the tail doesn't carry
-        // a phantom blank line. Mirrors the same fix in `generate_diff`.
-        let mut all_lines: Vec<&str> = raw.split('\n').collect();
-        if raw.ends_with('\n') {
-            all_lines.pop();
-        }
-        let total_file_lines = all_lines.len();
+        let total_file_lines = logical_line_count(&raw);
 
         let start_line = input.offset.map(|o| o.saturating_sub(1)).unwrap_or(0);
         if start_line >= total_file_lines {
@@ -121,7 +157,7 @@ impl AgentTool for ReadTool {
             );
         }
 
-        let selected: String;
+        let selected: &str;
         let user_limited: Option<usize>;
         if let Some(raw_limit) = input.limit {
             // Clamp to >= 1 (see find.rs / ls.rs / grep.rs): a degenerate
@@ -130,14 +166,18 @@ impl AgentTool for ReadTool {
             // is the line we just asked for) — a no-op the model can loop on.
             let limit = raw_limit.max(1);
             let end = (start_line + limit).min(total_file_lines);
-            selected = all_lines[start_line..end].join("\n");
+            let start_byte = line_start_byte(&raw, start_line);
+            let end_byte = line_end_byte(&raw, end, total_file_lines);
+            selected = &raw[start_byte..end_byte];
             user_limited = Some(end - start_line);
         } else {
-            selected = all_lines[start_line..].join("\n");
+            let start_byte = line_start_byte(&raw, start_line);
+            let end_byte = line_end_byte(&raw, total_file_lines, total_file_lines);
+            selected = &raw[start_byte..end_byte];
             user_limited = None;
         }
 
-        let trunc = truncate_head(&selected, None, None);
+        let trunc = truncate_head(selected, None, None);
         let start_display = start_line + 1;
 
         let output_text = if trunc.first_line_exceeds_limit {
@@ -181,8 +221,7 @@ impl AgentTool for ReadTool {
 
 /// Minimal base64 encoder (avoids pulling a base64 dependency).
 fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut chunks = input.chunks_exact(3);
     for chunk in chunks.by_ref() {
@@ -314,7 +353,10 @@ mod tests {
         let out = run_read(cwd, serde_json::json!({ "path": path.to_string_lossy() }))
             .await
             .unwrap();
-        assert!(!out.ends_with('\n'), "no trailing newline/blank line: {out:?}");
+        assert!(
+            !out.ends_with('\n'),
+            "no trailing newline/blank line: {out:?}"
+        );
         assert_eq!(out, "a\nb\nc");
         let _ = std::fs::remove_file(&path);
     }

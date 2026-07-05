@@ -1,16 +1,17 @@
 //! `grep` tool — search file contents (gitignore-aware, in-process).
 
 use std::collections::HashSet;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::tool::{AgentTool, ToolResult};
 use crate::tools::truncate::{
-    format_size, truncate_head, truncate_line, DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH,
+    DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, format_size, truncate_head, truncate_line,
 };
 use crate::tools::util::{display_path, resolve_to_cwd};
 
@@ -78,7 +79,10 @@ impl AgentTool for GrepTool {
 
         let search_path = resolve_to_cwd(input.path.as_deref().unwrap_or("."), &self.cwd);
         if !search_path.exists() {
-            anyhow::bail!("Path not found: {}", display_path(input.path.as_deref().unwrap_or("."), &self.cwd));
+            anyhow::bail!(
+                "Path not found: {}",
+                display_path(input.path.as_deref().unwrap_or("."), &self.cwd)
+            );
         }
         let is_dir = search_path.is_dir();
 
@@ -91,108 +95,156 @@ impl AgentTool for GrepTool {
             None => None,
         };
 
-        let files = collect_files(&search_path);
         let mut out_lines: Vec<String> = Vec::new();
         let mut match_count = 0usize;
         let mut match_limit_reached = false;
         let mut lines_truncated = false;
 
-        'outer: for file in files {
-            if let Some(gm) = &glob_matcher {
-                let rel = file.strip_prefix(&search_path).unwrap_or(&file).to_string_lossy().to_string();
-                let base = file
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if !gm.is_match(&rel) && !gm.is_match(&base) {
-                    continue;
+        if context == 0 {
+            let mut process_file = |file: PathBuf| {
+                if !file_matches_glob(&file, &search_path, glob_matcher.as_ref()) {
+                    return false;
                 }
-            }
-            let Ok(text) = std::fs::read_to_string(&file) else {
-                continue;
-            };
-            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-            let lines: Vec<&str> = normalized.split('\n').collect();
-            let display = display_for(&file, &search_path, is_dir);
+                let Ok(handle) = std::fs::File::open(&file) else {
+                    return false;
+                };
+                let display = display_for(&file, &search_path, is_dir);
 
-            // Collect this file's matching line indices first (honoring the
-            // global match limit) so context lines are emitted only once even
-            // when matches are close together. The previous per-match loop
-            // re-emitted overlapping context lines — and even re-emitted a
-            // shared match line — whenever two matches sat within `2*context`
-            // lines of each other.
-            let mut match_indices: Vec<usize> = Vec::new();
-            for (i, line) in lines.iter().enumerate() {
-                if re.is_match(line) {
+                for (idx, line) in std::io::BufReader::new(handle).lines().enumerate() {
+                    let Ok(mut line) = line else {
+                        return false;
+                    };
+                    if line.ends_with('\r') {
+                        line.pop();
+                    }
+                    if !re.is_match(&line) {
+                        continue;
+                    }
+
                     match_count += 1;
-                    match_indices.push(i);
                     if match_count > effective_limit {
                         match_limit_reached = true;
+                        return true;
+                    }
+
+                    let (truncated, was) = truncate_line(&line, None);
+                    if was {
+                        lines_truncated = true;
+                    }
+                    out_lines.push(format!("{}:{}: {}", display, idx + 1, truncated));
+                }
+
+                false
+            };
+
+            if search_path.is_file() {
+                process_file(search_path.clone());
+            } else {
+                let walker = ignore::WalkBuilder::new(&search_path)
+                    .hidden(false)
+                    .git_ignore(true)
+                    .git_global(true)
+                    .parents(true)
+                    .build();
+                for entry in walker.flatten() {
+                    if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                        continue;
+                    }
+                    if process_file(entry.into_path()) {
                         break;
                     }
                 }
             }
-
-            // We probe one match past the limit so "exactly N matches" is
-            // distinguishable from "more than N" (the limit notice must not fire
-            // when nothing was actually held back). That extra match lands in
-            // `match_indices`; if it pushed us over the global limit, drop it —
-            // and any surplus in this file — so exactly `effective_limit` matches
-            // are emitted total. `match_count - match_indices.len()` is the number
-            // of matches already emitted from earlier files.
-            if match_limit_reached {
-                let emitted_before = match_count - match_indices.len();
-                match_indices.truncate(effective_limit.saturating_sub(emitted_before));
-            }
-
-            if context == 0 {
-                for &i in &match_indices {
-                    let (truncated, was) = truncate_line(lines[i], None);
-                    if was {
-                        lines_truncated = true;
-                    }
-                    out_lines.push(format!("{}:{}: {}", display, i + 1, truncated));
+        } else {
+            let mut process_file = |file: PathBuf| {
+                if !file_matches_glob(&file, &search_path, glob_matcher.as_ref()) {
+                    return false;
                 }
-            } else if !match_indices.is_empty() {
-                let is_match: HashSet<usize> = match_indices.iter().copied().collect();
-                let n = lines.len();
-                // Merge the [i-context, i+context] windows around each match
-                // into maximal disjoint runs (overlapping or adjacent windows
-                // coalesce), mirroring `grep -C`. Emit each covered line once —
-                // matches with ':', context with '-' — with a "--" separator
-                // between disjoint groups.
-                let mut groups: Vec<(usize, usize)> = Vec::new();
-                for &i in &match_indices {
-                    let start = i.saturating_sub(context);
-                    let end = (i + context).min(n.saturating_sub(1));
-                    match groups.last_mut() {
-                        Some((_, prev_end)) if start <= *prev_end + 1 => {
-                            *prev_end = (*prev_end).max(end);
-                        }
-                        _ => groups.push((start, end)),
-                    }
+                let Ok(text) = std::fs::read_to_string(&file) else {
+                    return false;
+                };
+                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                let mut lines: Vec<&str> = normalized.split('\n').collect();
+                if normalized.ends_with('\n') {
+                    lines.pop();
                 }
-                for (gi, (start, end)) in groups.iter().enumerate() {
-                    if gi > 0 {
-                        out_lines.push("--".to_string());
-                    }
-                    for (offset, line) in lines[*start..=*end].iter().enumerate() {
-                        let c = start + offset;
-                        let (truncated, was) = truncate_line(line, None);
-                        if was {
-                            lines_truncated = true;
-                        }
-                        if is_match.contains(&c) {
-                            out_lines.push(format!("{}:{}: {}", display, c + 1, truncated));
-                        } else {
-                            out_lines.push(format!("{}-{}- {}", display, c + 1, truncated));
+                let display = display_for(&file, &search_path, is_dir);
+
+                // Collect this file's matching line indices first (honoring the
+                // global match limit) so context lines are emitted only once even
+                // when matches are close together.
+                let mut match_indices: Vec<usize> = Vec::new();
+                for (i, line) in lines.iter().enumerate() {
+                    if re.is_match(line) {
+                        match_count += 1;
+                        match_indices.push(i);
+                        if match_count > effective_limit {
+                            match_limit_reached = true;
+                            break;
                         }
                     }
                 }
-            }
 
-            if match_limit_reached {
-                break 'outer;
+                // Probe one match past the limit so exactly-N matches do not
+                // report a false limit notice. Drop the probe before emitting.
+                if match_limit_reached {
+                    let emitted_before = match_count - match_indices.len();
+                    match_indices.truncate(effective_limit.saturating_sub(emitted_before));
+                }
+
+                if !match_indices.is_empty() {
+                    let is_match: HashSet<usize> = match_indices.iter().copied().collect();
+                    let n = lines.len();
+                    let mut groups: Vec<(usize, usize)> = Vec::new();
+                    for &i in &match_indices {
+                        let start = i.saturating_sub(context);
+                        let end = (i + context).min(n.saturating_sub(1));
+                        match groups.last_mut() {
+                            Some((_, prev_end)) if start <= *prev_end + 1 => {
+                                *prev_end = (*prev_end).max(end);
+                            }
+                            _ => groups.push((start, end)),
+                        }
+                    }
+                    for (gi, (start, end)) in groups.iter().enumerate() {
+                        if gi > 0 {
+                            out_lines.push("--".to_string());
+                        }
+                        for (offset, line) in lines[*start..=*end].iter().enumerate() {
+                            let c = start + offset;
+                            let (truncated, was) = truncate_line(line, None);
+                            if was {
+                                lines_truncated = true;
+                            }
+                            if is_match.contains(&c) {
+                                out_lines.push(format!("{}:{}: {}", display, c + 1, truncated));
+                            } else {
+                                out_lines.push(format!("{}-{}- {}", display, c + 1, truncated));
+                            }
+                        }
+                    }
+                }
+
+                match_limit_reached
+            };
+
+            if search_path.is_file() {
+                process_file(search_path.clone());
+            } else {
+                let walker = ignore::WalkBuilder::new(&search_path)
+                    .hidden(false)
+                    .git_ignore(true)
+                    .git_global(true)
+                    .parents(true)
+                    .build();
+                for entry in walker.flatten() {
+                    if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                        continue;
+                    }
+                    if process_file(entry.into_path()) {
+                        break;
+                    }
+                }
             }
         }
 
@@ -226,27 +278,6 @@ impl AgentTool for GrepTool {
     }
 }
 
-/// Walk `root` (gitignore-aware, including hidden files) and return file paths.
-fn collect_files(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if root.is_file() {
-        files.push(root.to_path_buf());
-        return files;
-    }
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .parents(true)
-        .build();
-    for entry in walker.flatten() {
-        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            files.push(entry.into_path());
-        }
-    }
-    files
-}
-
 fn display_for(file: &Path, search_root: &Path, is_dir: bool) -> String {
     if is_dir {
         if let Ok(rel) = file.strip_prefix(search_root) {
@@ -265,6 +296,26 @@ fn display_for(file: &Path, search_root: &Path, is_dir: bool) -> String {
         .unwrap_or_default()
 }
 
+fn file_matches_glob(
+    file: &Path,
+    search_path: &Path,
+    glob_matcher: Option<&globset::GlobMatcher>,
+) -> bool {
+    let Some(gm) = glob_matcher else {
+        return true;
+    };
+    let rel = file
+        .strip_prefix(search_path)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .to_string();
+    let base = file
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    gm.is_match(&rel) || gm.is_match(&base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,8 +323,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn scratch_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("pi-grep-test-{label}-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("pi-grep-test-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -411,6 +462,22 @@ mod tests {
             out.contains("limit reached"),
             "truncation notice present\n{out}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn context_does_not_emit_phantom_line_after_trailing_newline() {
+        let dir = scratch_dir("context-trailing-newline");
+        std::fs::write(dir.join("f.txt"), "MATCH\n").unwrap();
+
+        let out = run_grep(
+            dir.clone(),
+            serde_json::json!({ "pattern": "MATCH", "path": dir.to_string_lossy(), "context": 1 }),
+        )
+        .await;
+
+        assert_eq!(out, "f.txt:1: MATCH");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

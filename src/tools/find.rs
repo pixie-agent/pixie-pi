@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::tool::{AgentTool, ToolResult};
-use crate::tools::truncate::{format_size, truncate_head, DEFAULT_MAX_BYTES};
+use crate::tools::truncate::{DEFAULT_MAX_BYTES, format_size, truncate_head};
 use crate::tools::util::{display_path, resolve_to_cwd};
 
 const DEFAULT_RESULT_LIMIT: usize = 1000;
@@ -72,22 +72,24 @@ impl AgentTool for FindTool {
         // +1 probe, a result set of exactly `effective_limit` files would spuriously
         // report "limit reached" even though nothing was held back.
         let mut result_limit_reached = false;
-        for file in collect_files(&search_path) {
-            let rel = file
-                .strip_prefix(&search_path)
-                .unwrap_or(&file)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let base = file
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if matcher.is_match(&rel) || matcher.is_match(&base) {
-                matches.push(rel);
-            }
-            if matches.len() > effective_limit {
-                result_limit_reached = true;
-                break;
+        if search_path.is_file() {
+            push_match(&search_path, &search_path, &matcher, &mut matches);
+        } else {
+            let walker = ignore::WalkBuilder::new(&search_path)
+                .hidden(false)
+                .git_ignore(true)
+                .git_global(true)
+                .parents(true)
+                .build();
+            for entry in walker.flatten() {
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                push_match(&entry.into_path(), &search_path, &matcher, &mut matches);
+                if matches.len() > effective_limit {
+                    result_limit_reached = true;
+                    break;
+                }
             }
         }
 
@@ -120,24 +122,27 @@ impl AgentTool for FindTool {
     }
 }
 
-fn collect_files(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if root.is_file() {
-        files.push(root.to_path_buf());
-        return files;
+fn push_match(
+    file: &Path,
+    search_path: &Path,
+    matcher: &globset::GlobMatcher,
+    matches: &mut Vec<String>,
+) {
+    let rel_path = file.strip_prefix(search_path).unwrap_or(file);
+    let rel = if rel_path.as_os_str().is_empty() {
+        file.file_name()
+            .map(|n| n.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default()
+    } else {
+        rel_path.to_string_lossy().replace('\\', "/")
+    };
+    let base = file
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if matcher.is_match(&rel) || matcher.is_match(&base) {
+        matches.push(rel);
     }
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .parents(true)
-        .build();
-    for entry in walker.flatten() {
-        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            files.push(entry.into_path());
-        }
-    }
-    files
 }
 
 #[cfg(test)]
@@ -147,8 +152,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn scratch_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("pi-find-test-{label}-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("pi-find-test-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -231,6 +236,23 @@ mod tests {
             !out.contains("No files found"),
             "limit:0 must not report 'No files found' when a file matches: {out}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn searching_a_single_file_returns_its_name() {
+        let dir = scratch_dir("single-file");
+        let path = dir.join("match.txt");
+        std::fs::write(&path, "x").unwrap();
+
+        let out = run_find(
+            dir.clone(),
+            serde_json::json!({ "pattern": "*.txt", "path": path.to_string_lossy() }),
+        )
+        .await;
+
+        assert_eq!(out, "match.txt");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

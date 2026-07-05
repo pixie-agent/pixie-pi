@@ -27,42 +27,44 @@ pub struct TruncationResult {
     pub last_line_partial: bool,
 }
 
+fn logical_line_count(content: &str) -> usize {
+    if content.is_empty() {
+        return 0;
+    }
+    let newlines = content.as_bytes().iter().filter(|&&b| b == b'\n').count();
+    newlines + usize::from(!content.ends_with('\n'))
+}
+
 /// Truncate from the **head** (keep the first lines), used by read/write/ls.
 /// Stops at whichever limit is hit first: `max_lines` or `max_bytes`.
-pub fn truncate_head(content: &str, max_lines: Option<usize>, max_bytes: Option<usize>) -> TruncationResult {
+pub fn truncate_head(
+    content: &str,
+    max_lines: Option<usize>,
+    max_bytes: Option<usize>,
+) -> TruncationResult {
     let max_lines = max_lines.unwrap_or(DEFAULT_MAX_LINES);
     let max_bytes = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
-    let mut lines: Vec<&str> = content.split('\n').collect();
-    // A trailing '\n' splits into a phantom empty final element (nearly every
-    // command output and source file ends in a newline). Drop it so a 3-line
-    // input counts as 3 lines, not 4 — otherwise `total_lines` is inflated and
-    // the line cap reports a spurious truncation or drops a real line. Mirrors
-    // the same accounting already applied in `read.rs` and `generate_diff`.
-    if content.ends_with('\n') {
-        lines.pop();
-    }
-    let total_lines = lines.len();
+    let total_lines = logical_line_count(content);
 
-    if !lines.is_empty() {
-        let first_line_bytes = lines[0].len();
-        if first_line_bytes > max_bytes {
-            return TruncationResult {
-                first_line_exceeds_limit: true,
-                total_lines,
-                max_bytes: Some(max_bytes),
-                max_lines: Some(max_lines),
-                ..Default::default()
-            };
-        }
+    let first_line_bytes = content.find('\n').unwrap_or(content.len());
+    if total_lines > 0 && first_line_bytes > max_bytes {
+        return TruncationResult {
+            first_line_exceeds_limit: true,
+            total_lines,
+            max_bytes: Some(max_bytes),
+            max_lines: Some(max_lines),
+            ..Default::default()
+        };
     }
 
-    let mut out: Vec<&str> = Vec::new();
+    let mut out = String::new();
     let mut bytes = 0usize;
+    let mut output_lines = 0usize;
     let mut truncated_by: Option<String> = None;
 
-    for line in &lines {
-        let line_bytes = line.len() + 1; // +1 for the '\n' separator
-        if out.len() + 1 > max_lines {
+    for line in content.split_terminator('\n') {
+        let line_bytes = line.len() + usize::from(output_lines > 0);
+        if output_lines + 1 > max_lines {
             truncated_by = Some("lines".into());
             break;
         }
@@ -70,18 +72,21 @@ pub fn truncate_head(content: &str, max_lines: Option<usize>, max_bytes: Option<
             truncated_by = Some("bytes".into());
             break;
         }
+        if output_lines > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
         bytes += line_bytes;
-        out.push(line);
+        output_lines += 1;
     }
 
     let truncated = truncated_by.is_some();
-    let content = out.join("\n");
     TruncationResult {
-        output_bytes: content.len(),
-        content,
+        output_bytes: out.len(),
+        content: out,
         truncated,
         truncated_by,
-        output_lines: out.len(),
+        output_lines,
         total_lines,
         max_lines: Some(max_lines),
         max_bytes: Some(max_bytes),
@@ -91,53 +96,65 @@ pub fn truncate_head(content: &str, max_lines: Option<usize>, max_bytes: Option<
 }
 
 /// Truncate from the **tail** (keep the most recent output), used by bash.
-pub fn truncate_tail(content: &str, max_lines: Option<usize>, max_bytes: Option<usize>) -> TruncationResult {
+pub fn truncate_tail(
+    content: &str,
+    max_lines: Option<usize>,
+    max_bytes: Option<usize>,
+) -> TruncationResult {
     let max_lines = max_lines.unwrap_or(DEFAULT_MAX_LINES);
     let max_bytes = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
-    let mut lines: Vec<&str> = content.split('\n').collect();
-    // Drop the phantom empty element produced by a trailing newline so the
-    // reported line count is exact. Bash passes raw command output (which almost
-    // always ends in '\n') here and reads `total_lines` / `output_lines` for its
-    // "Showing lines X-Y of N" truncation notice — without this drop that notice
-    // is off by one. See `truncate_head` for the full rationale.
-    if content.ends_with('\n') {
-        lines.pop();
-    }
-    let total_lines = lines.len();
+    let total_lines = logical_line_count(content);
+    let end = if content.ends_with('\n') {
+        content.len().saturating_sub(1)
+    } else {
+        content.len()
+    };
 
-    // Keep the last `max_lines` lines.
-    let start = total_lines.saturating_sub(max_lines);
-    let mut kept: Vec<&str> = lines[start..].to_vec();
-    let mut truncated_by = if start > 0 { Some("lines".into()) } else { None };
+    let bytes = content.as_bytes();
+    let mut start = end;
+    let mut line_end = end;
+    let mut kept_lines = 0usize;
+    let mut kept_bytes = 0usize;
+    let mut bytes_limit_hit = false;
 
-    // Enforce the byte cap from the tail.
-    let total_bytes: usize = kept.iter().map(|l| l.len() + 1).sum();
-    if total_bytes > max_bytes {
-        let mut bytes = 0usize;
-        let mut cut_from = 0;
-        for (i, line) in kept.iter().enumerate().rev() {
-            bytes += line.len() + 1;
-            if bytes > max_bytes {
-                cut_from = i + 1;
-                truncated_by = Some("bytes".into());
-                break;
-            }
+    while kept_lines < max_lines && kept_lines < total_lines {
+        let mut line_start = line_end;
+        while line_start > 0 && bytes[line_start - 1] != b'\n' {
+            line_start -= 1;
         }
-        if cut_from >= kept.len() {
-            cut_from = kept.len().saturating_sub(1);
+        let line_cost = line_end - line_start + usize::from(kept_lines > 0);
+        if kept_lines == 0 && line_cost > max_bytes {
+            bytes_limit_hit = true;
         }
-        kept = kept[cut_from..].to_vec();
+        if kept_lines > 0 && kept_bytes + line_cost > max_bytes {
+            bytes_limit_hit = true;
+            break;
+        }
+        kept_bytes += line_cost;
+        kept_lines += 1;
+        start = line_start;
+        if line_start == 0 {
+            break;
+        }
+        line_end = line_start - 1;
     }
+
+    let truncated_by = if bytes_limit_hit {
+        Some("bytes".into())
+    } else if kept_lines < total_lines {
+        Some("lines".into())
+    } else {
+        None
+    };
 
     let truncated = truncated_by.is_some();
-    let content = kept.join("\n");
-    let output_lines = kept.len();
+    let content = content[start..end].to_string();
     TruncationResult {
         output_bytes: content.len(),
         content,
         truncated,
         truncated_by,
-        output_lines,
+        output_lines: kept_lines,
         total_lines,
         max_lines: Some(max_lines),
         max_bytes: Some(max_bytes),
@@ -232,5 +249,51 @@ mod tests {
         assert_eq!(r.output_lines, 3);
         assert_eq!(r.content, "8\n9\n10");
         assert!(r.truncated);
+    }
+
+    #[test]
+    fn tail_reports_bytes_when_single_kept_line_exceeds_byte_limit() {
+        // Bash tail truncation intentionally keeps an over-limit final line so
+        // the caller can report that output was bounded by bytes. The optimized
+        // scanner must preserve that notice even when the file has only one
+        // logical line.
+        let r = truncate_tail("abcdef", Some(10), Some(3));
+        assert_eq!(r.content, "abcdef");
+        assert!(r.truncated);
+        assert_eq!(r.truncated_by.as_deref(), Some("bytes"));
+    }
+
+    #[test]
+    fn head_allows_single_line_at_exact_byte_limit() {
+        let r = truncate_head("abc", Some(10), Some(3));
+        assert_eq!(r.content, "abc");
+        assert_eq!(r.output_bytes, 3);
+        assert!(!r.truncated);
+    }
+
+    #[test]
+    fn tail_allows_single_line_at_exact_byte_limit() {
+        let r = truncate_tail("abc", Some(10), Some(3));
+        assert_eq!(r.content, "abc");
+        assert_eq!(r.output_bytes, 3);
+        assert!(!r.truncated);
+    }
+
+    #[test]
+    fn tail_handles_single_empty_line_with_trailing_newline() {
+        let r = truncate_tail("\n", Some(10), Some(10));
+        assert_eq!(r.content, "");
+        assert_eq!(r.output_lines, 1);
+        assert_eq!(r.total_lines, 1);
+        assert!(!r.truncated);
+    }
+
+    #[test]
+    fn tail_preserves_trailing_empty_logical_line() {
+        let r = truncate_tail("a\n\n", Some(2), Some(10));
+        assert_eq!(r.content, "a\n");
+        assert_eq!(r.output_lines, 2);
+        assert_eq!(r.total_lines, 2);
+        assert!(!r.truncated);
     }
 }

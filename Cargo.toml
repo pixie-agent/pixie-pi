@@ -1,13 +1,13 @@
 [package]
 name = "pixie-pi"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.82"
 authors = ["white1or1black"]
 description = "pixie-pi — an AI coding agent (read/write/edit/bash/grep/find/ls tools) for the command line and an interactive REPL."
 license = "MIT"
-repository = "https://github.com/white1or1black/pixie-pi"
-homepage = "https://github.com/white1or1black/pixie-pi"
+repository = "https://github.com/pixie-agent/pixie-pi"
+homepage = "https://github.com/pixie-agent/pixie-pi"
 documentation = "https://docs.rs/pixie-pi"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "llm", "anthropic"]
